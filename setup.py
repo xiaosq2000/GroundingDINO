@@ -22,47 +22,57 @@
 
 import glob
 import os
-import subprocess
-
+import platform
 import subprocess
 import sys
-
-def install_torch():
-    try:
-        import torch
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "torch"])
-
-# Call the function to ensure torch is installed
-install_torch()
 
 import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
 
-# groundingdino version info
+# Platform check
+if platform.system() != "Linux":
+    print("Warning: This package is only designed for Linux systems.")
+    print("It may not build correctly on your platform.")
+
+# GroundingDINO version info
 version = "0.1.0"
 package_name = "groundingdino"
 cwd = os.path.dirname(os.path.abspath(__file__))
 
 
-sha = "Unknown"
-try:
-    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cwd).decode("ascii").strip()
-except Exception:
-    pass
+def setup_cuda_env():
+    """Setup CUDA environment by finding nvcc executable."""
+    if "CUDA_HOME" in os.environ:
+        return True
+
+    # Try to find CUDA location via nvcc
+    try:
+        nvcc_path = subprocess.check_output(["which", "nvcc"], text=True).strip()
+        if nvcc_path:
+            cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
+            os.environ["CUDA_HOME"] = cuda_home
+            print(f"Auto-detected CUDA_HOME: {cuda_home}")
+            return True
+    except subprocess.SubprocessError:
+        print("Warning: nvcc not found in PATH.")
+        return False
 
 
 def write_version_file():
     version_path = os.path.join(cwd, "groundingdino", "version.py")
     with open(version_path, "w") as f:
         f.write(f"__version__ = '{version}'\n")
-        # f.write(f"git_version = {repr(sha)}\n")
 
+        # Try to get git version
+        sha = "Unknown"
+        try:
+            if os.path.exists(os.path.join(cwd, ".git")):
+                sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cwd).decode("ascii").strip()
+        except Exception:
+            pass
 
-requirements = ["torch", "torchvision"]
-
-torch_ver = [int(x) for x in torch.__version__.split(".")[:2]]
+        f.write(f"git_version = '{sha}'\n")
 
 
 def get_extensions():
@@ -78,12 +88,14 @@ def get_extensions():
     sources = [main_source] + sources
 
     extension = CppExtension
-
     extra_compile_args = {"cxx": []}
     define_macros = []
 
+    # Try to setup CUDA environment
+    setup_cuda_env()
+
     if CUDA_HOME is not None and (torch.cuda.is_available() or "TORCH_CUDA_ARCH_LIST" in os.environ):
-        print("Compiling with CUDA")
+        print(f"Compiling with CUDA support. CUDA_HOME = {CUDA_HOME}")
         extension = CUDAExtension
         sources += source_cuda
         define_macros += [("WITH_CUDA", None)]
@@ -94,10 +106,11 @@ def get_extensions():
             "-D__CUDA_NO_HALF2_OPERATORS__",
         ]
     else:
-        print("Compiling without CUDA")
+        print("Compiling without CUDA. Either CUDA_HOME is not set or PyTorch was not built with CUDA support.")
         define_macros += [("WITH_HIP", None)]
         extra_compile_args["nvcc"] = []
-        return None
+        # Return empty extensions for CPU-only mode
+        return []
 
     sources = [os.path.join(extensions_dir, s) for s in sources]
     include_dirs = [extensions_dir]
@@ -116,19 +129,7 @@ def get_extensions():
 
 
 def parse_requirements(fname="requirements.txt", with_version=True):
-    """Parse the package dependencies listed in a requirements file but strips
-    specific versioning information.
-
-    Args:
-        fname (str): path to requirements file
-        with_version (bool, default=False): if True include version specs
-
-    Returns:
-        List[str]: list of requirements items
-
-    CommandLine:
-        python -c "import setup; print(setup.parse_requirements())"
-    """
+    """Parse the package dependencies listed in a requirements file."""
     import re
     import sys
     from os.path import exists
@@ -196,25 +197,56 @@ def parse_requirements(fname="requirements.txt", with_version=True):
 if __name__ == "__main__":
     print(f"Building wheel {package_name}-{version}")
 
-    with open("LICENSE", "r", encoding="utf-8") as f:
-        license = f.read()
+    setup_success = False
 
-    write_version_file()
+    try:
+        write_version_file()
 
-    setup(
-        name="groundingdino",
-        version="0.1.0",
-        author="International Digital Economy Academy, Shilong Liu",
-        url="https://github.com/IDEA-Research/GroundingDINO",
-        description="open-set object detector",
-        license=license,
-        install_requires=parse_requirements("requirements.txt"),
-        packages=find_packages(
-            exclude=(
-                "configs",
-                "tests",
-            )
-        ),
-        ext_modules=get_extensions(),
-        cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
-    )
+        # Read requirements or use defaults
+        requirements = []
+        if os.path.exists("requirements.txt"):
+            requirements = parse_requirements("requirements.txt")
+        else:
+            requirements = ["torch>=1.7.0", "torchvision>=0.8.0"]
+
+        # Setup the package
+        setup(
+            name="groundingdino",
+            version=version,
+            author="International Digital Economy Academy, Shilong Liu",
+            url="https://github.com/IDEA-Research/GroundingDINO",
+            description="open-set object detector",
+            packages=find_packages(exclude=("configs", "tests")),
+            ext_modules=get_extensions(),
+            cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
+            install_requires=requirements,
+            python_requires=">=3.7",
+        )
+
+        # Try importing to verify success
+        try:
+            import groundingdino
+
+            try:
+                import groundingdino._C
+
+                print("Successfully built GroundingDINO with CUDA support!")
+            except ImportError:
+                print("Successfully built GroundingDINO (CPU-only mode)")
+            setup_success = True
+        except ImportError:
+            print("Warning: GroundingDINO was installed but cannot be imported.")
+
+    except Exception as e:
+        print(f"Error during setup: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    if not setup_success:
+        print("------------------------------------------------")
+        print("GroundingDINO setup did not complete successfully.")
+        print("Please check your CUDA and PyTorch installation.")
+        print("If you want to use CPU-only mode, make sure to unset CUDA_HOME.")
+        print("------------------------------------------------")
+        sys.exit(1)
